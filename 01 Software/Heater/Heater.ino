@@ -1,12 +1,17 @@
 #include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include "AiEsp32RotaryEncoder.h"
 #include "Arduino.h"
 #include "max6675.h"
 #include "Heater.h"
 #include "Ticker.h"
+#include "Oled.h"
+#include "EC11.h"
+#include "ui.h"
+#include "eeprom_flash.h"
+#include "reflow.h"
+#include <Adafruit_NeoPixel.h>
+#include "B3950.h"
 
 int thermoDO = 19;
 int thermoCS = 5;
@@ -14,126 +19,173 @@ int thermoCLK = 18;
 
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
-Heater heater;
+Heater pwm;
 Ticker heaterTick;
+Ticker adcTick;
+Ticker touchTick;
+Ticker ledTick;
+Reflow reflow;
 
+#define PIN        13
+#define NUMPIXELS   6
+Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
-#define ROTARY_ENCODER_A_PIN 35
-#define ROTARY_ENCODER_B_PIN 23
-#define ROTARY_ENCODER_BUTTON_PIN 26
+int adc_vol1;
+int adc_vol2;
+int vol1, vol2;
+int res_temp,tempture;
 
-#define ROTARY_ENCODER_VCC_PIN -1 /* 27 put -1 of Rotary encoder Vcc is connected directly to 3,3V; else you can use declared output pin for powering rotary encoder */
+int touch_mode, touch_fan, touch_power;
 
-#define ROTARY_ENCODER_STEPS 4
-
-//instead of changing here, rather change numbers above
-AiEsp32RotaryEncoder rotaryEncoder = AiEsp32RotaryEncoder(ROTARY_ENCODER_A_PIN, ROTARY_ENCODER_B_PIN, ROTARY_ENCODER_BUTTON_PIN, ROTARY_ENCODER_VCC_PIN, ROTARY_ENCODER_STEPS);
-
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 32 // OLED display height, in pixels
-
-
-#define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-#define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-#define NUMFLAKES     10 // Number of snowflakes in the animation example
-
-#define LOGO_HEIGHT   16
-#define LOGO_WIDTH    16
-
-void rotary_onButtonClick()
-{
-	static unsigned long lastTimePressed = 0;
-	//ignore multiple press in that time milliseconds
-	if (millis() - lastTimePressed < 500)
-	{
-		return;
-	}
-	lastTimePressed = millis();
-	Serial.print("button pressed ");
-	Serial.print(millis());
-	Serial.println(" milliseconds after restart");
-}
-
-void rotary_loop()
-{
-	//dont print anything unless value changed
-	if (rotaryEncoder.encoderChanged())
-	{
-		Serial.print("Value: ");
-		Serial.println(rotaryEncoder.readEncoder());
-    //heater.setTargetTemp(rotaryEncoder.readEncoder());
-	}
-	if (rotaryEncoder.isEncoderButtonClicked())
-	{
-		rotary_onButtonClick();
-	}
-}
-
-void IRAM_ATTR readEncoderISR()
-{
-	rotaryEncoder.readEncoder_ISR();
-}
+float temp;
 
 float getTemp(){
-  return thermocouple.readCelsius();
+  return temp;
 }
 
 void heater_handle(){
-  heater.handle();
-
-  
-}
-
-void rotaryEncoderInit(){
-  
-  pinMode(ROTARY_ENCODER_A_PIN,INPUT_PULLUP);
-  pinMode(ROTARY_ENCODER_B_PIN,INPUT_PULLUP);
-  
-  //we must initialize rotary encoder
-  rotaryEncoder.begin();
-  rotaryEncoder.setup(readEncoderISR);
-  rotaryEncoder.setBoundaries(0, 250, false); //minValue, maxValue, circleValues true|false (when max go to min and vice versa)
-  rotaryEncoder.setAcceleration(80); //or set the value - larger number = more accelearation; 0 or 1 means disabled acceleration
-}
-
-void displayInit(){
-
-  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
-  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;); // Don't proceed, loop forever
-  }
-
-  // Show initial display buffer contents on the screen --
-  // the library initializes this with an Adafruit splash screen.
-  display.display();
+  temp = thermocouple.readCelsius();
+  pwm.handle();
 }
 
 void heaterInit(){
-  heater.setTargetTemp(80.0);
-  heater.setGetTempCallback(getTemp);
-  heater.setPWMpin(14);
-  heater.setKp(20);
-  heater.begin(); 
+  pwm.setTargetTemp(80.0);
+  pwm.setGetTempCallback(getTemp);
+  pwm.setPWMpin(14,12);
+  pwm.setKp(17);
+  pwm.setKi(0.08);
+  //pwm.setKp(22);
+  //pwm.setKi(0.2);  
+  pwm.setKd(20);
+  pwm.init(); 
 
-  heaterTick.attach_ms(1000, heater_handle);
+  heaterTick.attach_ms(400, heater_handle);
+}
+
+void reflow_init()
+{
+  reflow.init(&pwm);
+}
+
+void adcTask(){
+ uint8_t j = 0;
+ 
+ adc_vol1 = analogRead(37);
+ vol1 = 3640*adc_vol1/4095;
+
+ res_temp = 3294*100*10/vol1-100*10;
+ 
+  for(j=0;j<140;j++)
+  {
+    if(res_temp>B3950[j])
+      break;
+  }
+  tempture = j-20-1; 
+  
+  printf("  BoardTemp:%d\n", tempture);
+}
+
+void ledTask(){
+ static uint8_t i = 0;
+#if 0
+ pixels.setPixelColor(0, pixels.Color(i, i, i));
+ pixels.show(); 
+ i++;
+ if(i>100)
+  i=0;
+#else
+ if(temp < 40)
+    pixels.setPixelColor(0, pixels.Color(0, 0, 10));
+ else
+ {
+    if(temp > 100)
+      pixels.setPixelColor(0, pixels.Color(100, 0, 0));
+    else
+      pixels.setPixelColor(0, pixels.Color(temp-40, 0, 0));
+ }
+ pixels.show();   
+
+#endif
+}
+
+void touchTask(){
+  static uint16_t i=0,j=0,k=0;
+
+  touch_mode = touchRead(T7);
+  touch_fan = touchRead(T8);
+  touch_power = touchRead(T9); 
+
+  if(touch_power<35)
+  {
+    i++;
+    if(i==5)
+    {
+      ui.onoff_button_down();
+    }
+  }
+  else
+  {
+    i = 0;
+  }
+
+  if(touch_fan<35){
+    j++;
+    if(j==5)
+    {
+      ui.fan_button_down();
+    }      
+  }
+  else{ 
+    j = 0;
+  }
+
+  if(touch_mode<40){
+    k++;
+    if(k==5)
+    {
+      pwm.temp_mode = !pwm.temp_mode;
+    }      
+  }
+  else{ 
+    k = 0;
+  }  
 }
 
 void setup()
 {
 	Serial.begin(115200);
 
-  displayInit();
-  rotaryEncoderInit();
   heaterInit();
+  eeprom.read_all_data();
+
+  oled.init();
+
+  ec11.begin(26,35, 23, ui_key_callb);
+  ec11.speed_up(true);
+  ec11.speed_up_max(20);
+
+  ui.page_switch_flg = true;
+  ui.init();
+
+  reflow_init();
+  delay(1000);
+
+  pinMode(12, OUTPUT);
+  digitalWrite(12, LOW);
+
+  adcTick.attach_ms(400, adcTask);
+  touchTick.attach_ms(100, touchTask);
+  ledTick.attach_ms(100, ledTask);
+
+  pixels.begin();
 }
 
 void loop()
 {
-	rotary_loop();
-	delay(200); //or do whatever you need to do...
-
-  printf("T7:%d T8:%d T9:%d\n", touchRead(T7),touchRead(T8),touchRead(T9));
+  ui.run_task();
+  reflow.task();
+  eeprom.write_task();
+	delay(50); 
+  
+  //printf("T7:%d T8:%d T9:%d\n", touch_mode,touch_fan,touch_power);
 }
